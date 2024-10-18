@@ -11,7 +11,7 @@ import os,sys
 import queue
 import time
 import glob
-
+import torch
 mx=-1
 my=-1
 display_mode = 0
@@ -23,6 +23,8 @@ hovering_over_quad = ""
 hires_mode = False
 size_ratio_x = 1.0
 size_ratio_y = 1.0
+frames_to_read = None
+frames_to_skip = None
 
 def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
     imgcopy = img.copy()
@@ -37,17 +39,23 @@ def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
 
 
 STREAKING=False
-NUM_MED = 2
-FRAME_MEDIAN_STRIDE = 10
+NUM_MED = 3
+FRAME_MEDIAN_STRIDE = 1
 def sigmoid(x):
     return 1/(1+np.exp(-(x-0.5)*10))
 
+
+
+frames_to_read = 50
+frames_to_skip = 5
+if hires_mode:
+    frames_to_read = 999
+    frames_to_skip =1 
+
+
+
+
 def read_movie(uncfi):
-    frames_to_read = 50
-    frames_to_skip = 5
-    if hires_mode:
-        frames_to_read = 90
-        frames_to_skip =2 
     cap = None
     cap = cv2.VideoCapture(uncfi)
     if cap is None:
@@ -64,7 +72,7 @@ def read_movie(uncfi):
     cap.release()
     del cap
     cap=None
-    return frames[::frames_to_skip],frames_to_skip
+    return frames
 
 def rect2yolo(rect,ww,wh):
     x = rect[0]
@@ -124,17 +132,44 @@ while True:
 
     # for each file,
     print(f"cfi={cfi}")
-
     # file name format: ../corrected/SLBE_20230831_155801_corrected.mp4
-    frames,frames_to_skip = read_movie(cfi)
-    ucframes,frames_to_skip = read_movie(uncfi)
-
+    frames = read_movie(cfi)
+    ucframes = read_movie(uncfi)
+    print("done reading movies")
+    annotations = {}
+    annotdf = None
+    if os.path.exists(labelsfi):
+        try:
+            annotdf = pd.read_csv(labelsfi,header=None,sep=' ')
+        except pd.errors.EmptyDataError:
+            annotdf = None
+    if annotdf is not None:
+        annotdf.columns = ("frame class cx cy w h".split(" "))
+        print (annotdf)
+        #annotdf["frame"] //= frames_to_skip
+        ww = frames[0].shape[1]
+        wh = frames[0].shape[0]
+        for rowi in range(annotdf.shape[0]):
+            framei = annotdf.loc[rowi,"frame"]
+            print(f"frame={framei}")
+            yoloroi = annotdf.loc[rowi,["cx","cy","w","h"]].to_list()
+            rectroi = list(yolo2rect(yoloroi,ww,wh))
+            if framei in annotations:
+                annotations[framei].append(rectroi)
+            else:
+                annotations[framei] = [ rectroi ]
+    print(f"annotations: {annotations}")
+    print("converting frames to numpy float32")
     frames = np.array(frames,dtype='float32')
+    print("normalizing frames")
     frames = np.float32(frames) / np.float32(frames.max())
+    print("done normalizing frames")
     nframes = frames.shape[0]
     #fmean = frames.mean()
     #for i in range(frames.shape[0]):
     #    frames[i,...] = frames[i,...] * (fmean/frames[i,...].mean())
+    print(f"frames.shape={frames.shape}")
+    print("copying frames to frames_org")
     frames_org = frames.copy()
     mdiff = np.zeros((nframes,frames.shape[1],frames.shape[2]),dtype='float32')
     print(f"frames.shape={frames.shape}")
@@ -142,11 +177,13 @@ while True:
     meds = []
     print(f"copying {nframes//FRAME_MEDIAN_STRIDE} frames to GPU")
     framescu = np.array(frames)
+    starttime = time.time()
     for i in range(0,nframes,FRAME_MEDIAN_STRIDE):
         print(f"median {i}...",end='',flush=True)
         rangelo=np.clip(i-NUM_MED,0,nframes-1)
         rangehi=np.clip(i+NUM_MED,0,nframes-1)
-        meds.append(np.median(framescu[rangelo:rangehi,...,1],axis=0))
+        meds.append(torch.median(torch.tensor(framescu[rangelo:rangehi,...,1]),dim=0).values.numpy())
+        #meds.append(np.median(framescu[rangelo:rangehi,...,1],axis=0))
         #meds.append(np.median(frames[rangelo:rangehi,...,1],axis=0))
         print("done",flush=True)
     # interpolate medians
@@ -163,7 +200,7 @@ while True:
                     meds[j//FRAME_MEDIAN_STRIDE] * (1.0-r) +
                     meds[j//FRAME_MEDIAN_STRIDE+1] * r
                     )
-    
+    print(f"median time: {time.time()-starttime}")
 
     for i in range(frames.shape[0]):
 
@@ -245,7 +282,7 @@ while True:
 
     #frames = frames[NUM_MED:-NUM_MED,...]
     print(f"normalizing frames")
-    frames = frames/frames.max()
+    #frames = frames/frames.max()
     print(f"blending frames and mdiffs")
     frames[...,0] = frames[...,0]*(mdiff*2+0.3)
     frames[...,1] = frames[...,1]*(mdiff*2+0.3)
@@ -268,9 +305,9 @@ while True:
         pos_frames = int(open("posframes.txt").read())
     ok = True
     if STREAKING:
-        num_display_modes = 5
+        num_display_modes = 6
     else:
-        num_display_modes = 4
+        num_display_modes = 5
     pause_phase = 0
     zoom_rect = None
     editing_rect = False
@@ -279,30 +316,15 @@ while True:
     ex1=None
     ey1=None
     mdblclk=False
-    annotations = {}
-    annotdf = None
-    if os.path.exists(labelsfi):
-        try:
-            annotdf = pd.read_csv(labelsfi,header=None,sep=' ')
-        except pd.errors.EmptyDataError:
-            annotdf = None
 
-    if annotdf is not None:
-        annotdf.columns = ("frame class cx cy w h".split(" "))
-        annotdf["frame"] //= frames_to_skip
-        ww = frames[0].shape[1]
-        wh = frames[0].shape[0]
-        for i in range(annotdf.shape[0]):
-            yoloroi = annotdf.loc[i,["cx","cy","w","h"]].to_list()
-            rectroi = list(yolo2rect(yoloroi,ww,wh))
-
-            if annotdf.loc[i,"frame"] in annotations:
-                annotations[annotdf.loc[i,"frame"]].append(rectroi)
-            else:
-                annotations[annotdf.loc[i,"frame"]] = [ rectroi ]
 
 
     while ok:
+        frames_to_read = 50
+        frames_to_skip = 5
+        if hires_mode:
+            frames_to_read = 999
+            frames_to_skip =1 
         if not zoom_rect:
             zx0 = 0
             zy0 = 0
@@ -335,6 +357,28 @@ while True:
         elif display_mode == 3:
             displayframe = mdiff[pos_frames].copy()
         elif display_mode == 4:
+            # optical flow
+            # always compute optical flow from the original frames
+            cur = cv2.cvtColor(frames[pos_frames],cv2.COLOR_BGR2GRAY)
+            nxt = cv2.cvtColor(frames[pos_frames+1],cv2.COLOR_BGR2GRAY)
+            flow0 = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,3,3,5,1.2,cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
+            flow = cv2.calcOpticalFlowFarneback(cur,nxt,flow0,0.5,3,3,3,5,1.2,cv2.OPTFLOW_USE_INITIAL_FLOW) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
+            flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
+            #flowmag = np.log(np.log(flowmag+1)+1)
+            flowmag50 = np.quantile(flowmag,0.90)
+            flowmag[flowmag>flowmag50] = flowmag50
+            if hovering_over is not None and pos_frames in annotations:
+                an = annotations[pos_frames][hovering_over]
+                flow = flow[int(an[1]):int(an[1]+an[3]),int(an[0]):int(an[0]+an[2])]
+                flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
+                flowmag = flowmag / flowmag.max()
+                displayframe = np.zeros_like(frames[pos_frames])
+                displayframe[an[1]:an[1]+an[3],an[0]:an[0]+an[2]] = np.stack([flowmag]*3,axis=-1)
+            else:
+                print("flowmag max=",flowmag.max())
+                flowmag = flowmag / flowmag.max()
+                displayframe = np.stack([flowmag]*3,axis=-1)
+        elif display_mode == 5:
             displayframe = streaks[pos_frames].copy()
         if zoom_rect:
             displayframe = displayframe[zy0:zy1,zx0:zx1,...]
@@ -451,6 +495,35 @@ while True:
                 pos_frames += 1
         elif k == 10 or k == 13:
             display_mode = (display_mode + 1) % num_display_modes
+        elif k == ord('o'):
+            if pos_frames+1 < frames.shape[0] and hovering_over is not None and pos_frames in annotations:
+                print(f"applying optical flow to rectangle {hovering_over}")
+                cur = frames[pos_frames][...,1]
+                nxt = frames[pos_frames+1][...,1]
+                #cur = cv2.cvtColor(frames[pos_frames],cv2.COLOR_BGR2GRAY)
+                #nxt = cv2.cvtColor(frames[pos_frames+1],cv2.COLOR_BGR2GRAY)
+                flow = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,1,3,5,1.2,0) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
+                flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
+                an = annotations[pos_frames][hovering_over]
+                flow = flow[int(an[1]):int(an[1]+an[3]),int(an[0]):int(an[0]+an[2])]
+                fs = flow.shape
+                flow=flow[fs[0]//4:fs[0]*3//4,fs[1]//4:fs[1]*3//4]
+                # compute mean of flow over rectangle
+                flowx = np.quantile(flow[...,0],0.970)
+                flowy = np.quantile(flow[...,1],0.970)
+                print(f"flowx={flowx}, flowy={flowy}")
+                # apply flow to rectangle
+                newan = an.copy()
+                newan[0] -= flowx * frames.shape[2]*500.0
+                newan[1] -= flowy * frames.shape[1]*500.0
+                if pos_frames+1 in annotations:
+                    annotations[pos_frames+1].append(newan)
+                else:
+                    annotations[pos_frames+1] = [ newan ]
+                pos_frames += 1
+                save_flag = True
+
+
         elif k == ord('x'):
             if hovering_over is not None and not deleting_mode:
                 deleting_mode = True
@@ -466,21 +539,23 @@ while True:
                 deleting_mode = False
                 # 'y' has been pressed following an 'x', delete the annotation
                 # delete the annotation under the mouse
-                if pos_frames in annotations:
-                    an = annotations[pos_frames][deleting_ann]
+                if deleting_ann is not None and pos_frames in annotations:
                     del annotations[pos_frames][deleting_ann]
-                    deleting_ann = None
+                    #deleting_ann = None
                     # write to file
                     # must rewrite the entire file
                     open(labelsfi,"w").write("")
                     for p_frames in annotations:
                         for ai in range(len(annotations[p_frames])):
-                            an = annotations[pos_frames][ai]
+                            if p_frames == pos_frames and ai == deleting_ann:
+                                continue
+                            an = annotations[p_frames][ai]
                             yoloroi = list(rect2yolo(an,ww,wh))
-                            open(labelsfi,"a").write(f"{p_frames*frames_to_skip} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
+                            open(labelsfi,"a").write(f"{p_frames} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
                     # save pos_frames
-                    open("posframes.txt","w").write(f"{pos_frames*frames_to_skip}")
-                    break
+                    open("posframes.txt","w").write(f"{pos_frames}")
+                    deleting_ann = None
+                    pause_mode = True
 
         elif (k == 81 or k == 65361 or k == ord('a')) and hovering_over is not None: # left arrow
             if hovering_over_quad == "NW":
@@ -551,7 +626,7 @@ while True:
                 for ai in range(len(annotations[p_frames])):
                     an = annotations[p_frames][ai]
                     yoloroi = list(rect2yolo(an,ww,wh))
-                    open(labelsfi,"a").write(f"{p_frames*frames_to_skip} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
+                    open(labelsfi,"a").write(f"{p_frames} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
             save_flag = False
 
 
@@ -626,7 +701,7 @@ while True:
                     for ai in range(len(annotations[pos_frames])):
                         an = annotations[pos_frames][ai]
                         if zoom_rect:
-                            cv2.rectangle(displayframe,(an[0]-zx0,an[1]-zy0),(an[0]+an[2]-zx0,an[1]+an[3]-zy0),(0,255,255),1)
+                            cv2.rectangle(displayframe,(int(an[0]-zx0),int(an[1]-zy0)),(int(an[0]+an[2]-zx0),int(an[1]+an[3]-zy0)),(0,255,255),1)
                             ex0 = an[0]-zx0
                             ex1 = an[0]+an[2]-zx0
                             ey0 = an[1]-zy0
@@ -665,7 +740,7 @@ while True:
                     # convert to yolo format
                     yoloroi = rect2yolo(roi,ww,wh)
                     # write to file - we know it's a new annotation so we can append
-                    open(labelsfi,"a").write(f"{pos_frames*frames_to_skip} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n");
+                    open(labelsfi,"a").write(f"{pos_frames} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n");
                     # save pos_frames
                     open("posframes.txt","w").write(f"{pos_frames}")
                 else:
