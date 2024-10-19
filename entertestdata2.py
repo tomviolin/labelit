@@ -38,6 +38,23 @@ def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
     return imgcopy
 
 
+def put_text_rect(img,text,rect,color,font=cv2.FONT_HERSHEY_DUPLEX,font_scale=1,thickness=1,pos="abovetopleft", adj_for_baseline=True):
+    txtrect = cv2.getTextSize(text,font,font_scale,thickness)
+    # adjust text rectangle to include the descenders below the baseline
+    # example txtrect = ((92,12),5)
+    if not adj_for_baseline:
+        txtrect = ((txtrect[0][0],txtrect[0][1]-1),0)
+    else:
+        txtrect = ((txtrect[0][0],txtrect[0][1]+txtrect[1]),txtrect[1])
+    if pos=="abovetopleft":
+        cv2.rectangle(img,(rect[0],rect[1]-txtrect[0][1]-6),(rect[0]+2+txtrect[0][0],rect[1]-1),color,-1)
+        cv2.putText(img,text,(rect[0]+2,rect[1]-2-txtrect[1]),font,font_scale,(  0,0,0),0,cv2.LINE_AA)
+    elif pos=="belowtopleft":
+        cv2.rectangle(img,(rect[0]-txtrect[0][0]-8,rect[1]+1),(rect[0]+2+txtrect[0][0]-9,rect[1]+2+txtrect[0][1]+6),color,-1)
+        cv2.putText(img,text,(rect[0]+2-txtrect[0][0]-6,rect[1]+4+txtrect[0][1]),font,font_scale,(  0,0,0),0,cv2.LINE_AA)
+    return img
+
+
 STREAKING=False
 NUM_MED = 3
 FRAME_MEDIAN_STRIDE = 1
@@ -402,9 +419,11 @@ while True:
                 if not zoom_rect:
                     ex = [int(an[0]/size_ratio_x),int(an[1]/size_ratio_y),int(an[2]/size_ratio_x),int(an[3]/size_ratio_y)]
                     cv2.rectangle(displayframe,ex,(0,0,255),1)
+                    put_text_rect(displayframe,f"{ai}",(ex[0],ex[1]),(255,255,0),cv2.FONT_HERSHEY_DUPLEX,0.25,1,"belowtopleft",False)
                 else:
                     ex = [int((an[0]-zx0)/size_ratio_x),int((an[1]-zy0)/size_ratio_y),int(an[2]/size_ratio_x),int(an[3]/size_ratio_y)]
                     cv2.rectangle(displayframe,ex,(0,0,255),1)
+                    put_text_rect(displayframe,f"{ai}",(ex[0],ex[1]),(255,255,0),cv2.FONT_HERSHEY_DUPLEX,0.25,1,"belowtopleft",False)
       
                 # see if we are hovering over this annotation
                 #        ex[0]  
@@ -415,7 +434,7 @@ while True:
                 #         ex[0]+ex[2]
                 #
                 if mx/size_ratio_x >= ex[0] and mx/size_ratio_x <= ex[0]+ex[2] and my/size_ratio_y >= ex[1] and my/size_ratio_y <= ex[1]+ex[3]:
-                    cv2.rectangle(displayframe,ex,(255,127,127),1)
+                    cv2.rectangle(displayframe,ex,(255,220,220),1)
                     if dragging_mode:
                         cv2.rectangle(displayframe,ex,(255,255,127),1)
                     hovering_over = ai
@@ -450,9 +469,9 @@ while True:
                             hovering_over_quad = "SE"
                     if deleting_mode:
                         if flash:
-                            cv2.putText(displayframe,"deleting",(ex[0],ex[1]-10),cv2.FONT_HERSHEY_DUPLEX,1,(  0,127,255),2)
+                            put_text_rect(displayframe,"delete(y/n)",(ex[0],ex[1]),(0,127,255), cv2.FONT_HERSHEY_DUPLEX,0.5,1)
                     else:
-                        cv2.putText(displayframe,f"hov: {pos_frames}:{hovering_over}",(ex[0],ex[1]-10),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
+                        put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}",(ex[0],ex[1]),(255,255,255),cv2.FONT_HERSHEY_DUPLEX,0.5,1)
                 '''
                 if mx >= ex0 and mx <= ex1 and my >= ey0 and my <= ey1:
                     flash = (int(time.time()*3)%2) > 0
@@ -471,7 +490,7 @@ while True:
                         int(ey1/size_ratio_y)),color,0.3,bdr)
                     break
                     '''
-        cv2.putText(displayframe,f"{findex:04d}:{pos_frames:03d}{deleting_mode}{deleting_ann}",(10,30),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
+        cv2.putText(displayframe,f"{findex:04d}:{pos_frames:03d}{deleting_mode}{deleting_ann}",(10,30),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),1,cv2.LINE_AA)
         cv2.imshow('frame', displayframe)
         # print(f"frame redrawn: pos_frames={pos_frames}")
         # check for keyboard events
@@ -488,11 +507,16 @@ while True:
             hires_mode = False
             break
         elif k == ord('n'):
-            findex += 1
-            hires_mode = False
-            findex = findex % len(fdf_filenames)
-            finish=False
-            break;
+            if deleting_mode:
+                deleting_mode = False
+                deleting_ann = None
+                print('deleting cancelled')
+            else:
+                findex += 1
+                hires_mode = False
+                findex = findex % len(fdf_filenames)
+                finish=False
+                break;
         elif k == ord('p'):
             if findex > 0:
                 findex -= 1
@@ -738,16 +762,19 @@ while True:
                         dragging_origin_y = my
                         save_flag = True
             elif event == cv2.EVENT_LBUTTONDOWN:
-                # scan existing annotations to see if we clicked inside one
+                # if we are hovering over an annotation, start dragging it
                 if hovering_over is not None and hovering_over >= 0 and hovering_over < len(annotations[pos_frames]):
                     dragging_mode = True
                     dragging_ann = hovering_over
                     dragging_origin_x = mx
                     dragging_origin_y = my
                 else:
+                    # create a new annotation
+                    # clear out any dragging mode info
                     dragging_mode = False
                     dragging_ann = None
-                    newan = [mx-5,my-5,10,10]
+                    # establish the new annotation rectangle
+                    newan = [mx-8,my-8,12,12]
                     if zoom_rect:
                         newan[0] += zx0
                         newan[1] += zy0
@@ -756,6 +783,10 @@ while True:
                     else:
                         annotations[pos_frames] = [ newan ]
                     save_flag = True
+                    dragging_mode = True
+                    dragging_ann = len(annotations[pos_frames])-1
+                    dragging_origin_x = mx
+                    dragging_origin_y = my
 
 
             elif event == cv2.EVENT_LBUTTONUP:
