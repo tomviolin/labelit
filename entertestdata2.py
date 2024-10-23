@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Major decision:
+    default internal representation of all coordinates shall be
+    in normalized units of the frame size.  This will allow
+    the program to work with any frame size, and will allow
+    the program to work with any display size.
+    The program will convert to and from pixel coordinates
+    as needed for display and for file I/O.
+    The program will also convert to and from pixel coordinates
+    as needed for OpenCV functions.
+    if zoomed in, the program logic should be the same. Only the
+    functions that actually draw to the screen should be affected.
+    We are still in the normalized coordinate system, normalized
+    with respect to the entire frame size. All these "if zoom_rect"
+    statements should be removed from mainline code and encapsulated
+    within the display functions. This will allow the mainline code to
+    express the business logic without carrying the burden of caring
+    about the zoomed-in state.
+
+"""
 
 import numpy as np
 #import cupy as cp
@@ -12,23 +33,130 @@ import queue
 import time
 import glob
 import torch
-mx=-1
-my=-1
+
+# local imports
+from textbox import put_text_rect
+
+# signature for imported put_text_rect function.
+# def put_text_rect(img, text, position, font_face, font_size, rect_color, font_color, font_thickness, tightness=0, anchor='baseline-left'):
+
+# global variables which define the state of the display
+displayframe = None
+zx0 = None
+zy0 = None
+zx1 = None
+zy1 = None
+
+
+nmmousex=None
+nmmousey=None
+pxmousex=None
+pxmousey=None
+
+
 display_mode = 0
 DISPLAY_WIDTH = 1920*2//4
 DISPLAY_HEIGHT = 1080*2//4
 
+creating_mode = False
 hovering_over = None
 hovering_over_quad = ""
 hires_mode = False
-size_ratio_x = 1.0
-size_ratio_y = 1.0
+save_flag = False
+# drawing transformation state
+# transformation state is a 4-tuple of (zx0,zy0,zx1,zy1)
+# where x0,y0 is the upper left corner of the rectangle
+# and x1,y1 is the lower right corner of the rectangle
+#
+# the only difference between physical and pixel coordinates
+# is the  offset of the zoomed-in area rectangle.
+
+# remember that the zoomed-in area is a rectangle in normalized coordinates
+# that is a subset of the entire frame.  The zoomed-in area is then
+
+# this diagram and notes are for the x-axis only.  The y-axis is analogous.
+
+# pixels:      0------------------------------------DISPLAY_WIDTH
+# normalized: 0.0------------------------------------1.0
+# zoomed:            zx0-----zx1
+#              -----/          \---------------------
+#             /                                      \
+# pixels:     0------------------------------------DISPLAY_WIDTH
+# zoom normalized: zx0-----------------------------zx1
+
+# norm_to_pix = lambda x: int(x*DISPLAY_WIDTH)
+# pix_to_norm = lambda x: x/DISPLAY_WIDTH
+# when zoomed in:
+# zoomed_norm_to_pix = lambda x: int((x-zx0)*DISPLAY_WIDTH/(zx1-zx0))
+# zoomed_pix_to_norm = lambda x: x/DISPLAY_WIDTH*(zx1-zx0)+zx0
+# the zoomed-in area is a rectangle in normalized coordinates
+zx0 = 0
+zy0 = 0
+zx1 = 1.0
+zy1 = 1.0
+
+def norm2pix(rect):
+    # this should work for points or rectangles,
+    # and it will work for x,y,w,h or x0,y0,x1,y1 formats
+    if displayframe is None or displayframe.shape[0:2] != (DISPLAY_HEIGHT,DISPLAY_WIDTH):
+        print(f"illegal call to pix2norm: displayframe not initialized")
+        exit()
+    retv = []
+    # always take zoomed-in area into account
+    for i in range(len(rect)):
+        if i % 2 == 0:
+            retv.append(int((rect[i]-zx0)/(zx1-zx0)*DISPLAY_WIDTH))
+        else:
+            retv.append(int((rect[i]-zy0)/(zy1-zy0)*DISPLAY_HEIGHT))
+
+    return tuple(retv)
+    # ba da bing!
+
 frames_to_read = None
 frames_to_skip = None
 
+
+def pix2norm(pixrect):
+    # this should work for points or rectangles,
+    # and it will work for x,y,w,h or x0,y0,x1,y1 formats
+    if displayframe is None or displayframe.shape[0:2] != (DISPLAY_HEIGHT,DISPLAY_WIDTH):
+        print(f"illegal call to pix2norm: displayframe not initialized")
+        exit()
+    retv = []
+    # always take zoomed-in area into account
+    for i in range(len(pixrect)):
+        if i % 2 == 0:
+            retv.append((pixrect[i]/DISPLAY_WIDTH + zx0) * (zx1-zx0))
+        else:
+            retv.append((pixrect[i]/DISPLAY_HEIGHT + zy0) * (zy1-zy0))
+    return tuple(retv)
+
+
+def norm_to_imgpix(img,rect):
+    retv = []
+    for i in range(len(rect)):
+        if i % 2 == 0:
+            retv.append(int(rect[i]*img.shape[1]))
+        else:
+            retv.append(int(rect[i]*img.shape[0]))
+    return tuple(retv)
+
+def imgpix_to_norm(img,rect):
+    retv = []
+    for i in range(len(rect)):
+        if i % 2 == 0:
+            retv.append(rect[i]/img.shape[1])
+        else:
+            retv.append(rect[i]/img.shape[0])
+    return tuple(retv)
+
+
+
 def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
+    # This is a low-level function that only operates on pixel coordinates.  
+    #   The caller is responsible for any conversions.
     imgcopy = img.copy()
-    x0, y0, x1, y1 =  [rect[0], rect[1], rect[2], rect[3]]
+    x0, y0, x1, y1 =  (rect[0], rect[1], rect[2], rect[3])
     rx0 = x0+1
     ry0 = y0+1
     rx1 = x1-1
@@ -37,22 +165,6 @@ def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
     cv2.addWeighted(imgcopy, alpha, img, 1-alpha, 0, img)
     return imgcopy
 
-
-def put_text_rect(img,text,rect,color,font=cv2.FONT_HERSHEY_DUPLEX,font_scale=1,thickness=1,pos="abovetopleft", adj_for_baseline=True):
-    txtrect = cv2.getTextSize(text,font,font_scale,thickness)
-    # adjust text rectangle to include the descenders below the baseline
-    # example txtrect = ((92,12),5)
-    if not adj_for_baseline:
-        txtrect = ((txtrect[0][0],txtrect[0][1]-1),0)
-    else:
-        txtrect = ((txtrect[0][0],txtrect[0][1]+txtrect[1]),txtrect[1])
-    if pos=="abovetopleft":
-        cv2.rectangle(img,(rect[0],rect[1]-txtrect[0][1]-6),(rect[0]+2+txtrect[0][0],rect[1]-1),color,-1)
-        cv2.putText(img,text,(rect[0]+2,rect[1]-2-txtrect[1]),font,font_scale,(  0,0,0),0,cv2.LINE_AA)
-    elif pos=="belowtopleft":
-        cv2.rectangle(img,(rect[0]-txtrect[0][0]-8,rect[1]+1),(rect[0]+2+txtrect[0][0]-9,rect[1]+2+txtrect[0][1]+6),color,-1)
-        cv2.putText(img,text,(rect[0]+2-txtrect[0][0]-6,rect[1]+4+txtrect[0][1]),font,font_scale,(  0,0,0),0,cv2.LINE_AA)
-    return img
 
 
 STREAKING=False
@@ -63,7 +175,7 @@ def sigmoid(x):
 
 
 
-frames_to_read = 50
+frames_to_read = 10
 frames_to_skip = 5
 if hires_mode:
     frames_to_read = 999
@@ -91,31 +203,27 @@ def read_movie(uncfi):
     cap=None
     return frames
 
-def rect2yolo(rect,ww,wh):
+# convert rectangle 
+def rect2yolo(rect):
     x = rect[0]
     y = rect[1]
     w = rect[2]
     h = rect[3]
 
-    cx = x+w//2
-    cy = y+h//2
-    return (cx/ww,cy/wh,w/ww,h/wh)
+    cx = x+w/2
+    cy = y+h/2
+    return (cx,cy,w,h)
 
-def yolo2rect(yolo,ww,wh):
-    cx = int(yolo[0] * ww)
-    cy = int(yolo[1] * wh)
-    w = int(np.abs(yolo[2]*ww))
-    h = int(np.abs(yolo[3]*wh))
+def yolo2rect(yolo):
+    cx = yolo[0]
+    cy = yolo[1]
+    w  = yolo[2]
+    h  = yolo[3]
 
-    x = cx-w//2
-    y = cy-h//2
+    x = cx-w/2
+    y = cy-h/2
     return (x,y,w,h)
 
-
-def select_roi(frame):
-
-    roi = cv2.selectROI(frame)
-    return roi
 
 fdf_filenames = sorted(glob.glob("../corrected/*.mp4"))
 print (f"found {len(fdf_filenames)} files")
@@ -130,7 +238,7 @@ fdf_labels = [ fi.replace("/corrected/","/labels/").replace("_corrected","").rep
 # MOUSE EVENT QUEUE
 mouseq = queue.Queue()
 def mouse_event(e, x,y,flags,param):
-    mouseq.put_nowait({"e":e, "x":x*size_ratio_x, "y":y*size_ratio_y, "flags":flags, "param":param})
+    mouseq.put_nowait({"e":e, "x":(x/(zx1-zx0)+zx0), "y":(y/(zy1-zy0)+zy0), "flags":flags, "param":param})
 # END MOUSE EVENT QUEUE
 window_setup = False
 findex = 0
@@ -164,14 +272,12 @@ while True:
         annotdf.columns = ("frame class cx cy w h".split(" "))
         print (annotdf)
         #annotdf["frame"] //= frames_to_skip
-        ww = frames[0].shape[1]
-        wh = frames[0].shape[0]
         for rowi in range(annotdf.shape[0]):
             framei = annotdf.loc[rowi,"frame"]
             print(f"frame={framei}")
             yoloroi = annotdf.loc[rowi,["cx","cy","w","h"]].to_list()
-            rectroi = list(yolo2rect(yoloroi,ww,wh))
-            if framei in annotations:
+            rectroi = list(yolo2rect(yoloroi))
+            if framei in range(len(annotations)):
                 annotations[framei].append(rectroi)
             else:
                 annotations[framei] = [ rectroi ]
@@ -317,7 +423,7 @@ while True:
     dragging_mode = False
     dragging_origin_x = None
     dragging_origin_y = None
-    dragging_ann = None
+    dragging_ai = None
 
     pause_mode = True
     one_shot = False
@@ -329,61 +435,30 @@ while True:
         num_display_modes = 6
     else:
         num_display_modes = 5
-    pause_phase = 0
-    zoom_rect = None
-    editing_rect = False
-    ex0=None
-    ey0=None
-    ex1=None
-    ey1=None
-    mdblclk=False
-
-
-
-    while ok:
-        save_flag = False
+    while ok and not finish:
         flash = (int(time.time()*3)%2) > 0
-        frames_to_read = 50
-        frames_to_skip = 5
-        if hires_mode:
-            frames_to_read = 999
-            frames_to_skip =1 
-        if not zoom_rect:
-            zx0 = 0
-            zy0 = 0
-            zx1 = frames.shape[2]
-            zy1 = frames.shape[1]
-        if pause_mode:
-            pause_phase += np.pi/90.
-        else:
-            pause_phase = 0
-        #canvasframe = frames[pos_frames]*(np.cos(pause_phase)**2) + frames_org[pos_frames] * (1-np.cos(pause_phase)**2)
-        #canvasframe = np.uint8(255-mdiff[pos_frames]*255)
-        #canvasframe = np.stack([canvasframe]*3,axis=-1)
-        #canvasframe = cv2.drawKeypoints(canvasframe, blobKeypoints[pos_frames],(0,0,255),cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-        #print(blobKeypoints[pos_frames])
         if window_setup==False:
             print(f"setting up GUI")
-            cv2.namedWindow('frame') # , cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('frame', DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            cv2.namedWindow('frame' , cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('frame', DISPLAY_WIDTH, DISPLAY_HEIGHT+64)
             cv2.moveWindow('frame', 150, 5)
             cv2.setMouseCallback('frame',mouse_event)
             window_setup = True
         #print(f"pos_frames={pos_frames}")
         #print(f"len(ucframes)={len(ucframes)}")
         if display_mode == 0:
-            displayframe = ucframes[pos_frames].copy()
+            predisplayframe = ucframes[pos_frames].copy()
         if display_mode == 1:
-            displayframe = frames_org[pos_frames].copy()
+            predisplayframe = frames_org[pos_frames].copy()
         elif display_mode == 2:
-            displayframe = frames[pos_frames].copy()
+            predisplayframe = frames[pos_frames].copy()
         elif display_mode == 3:
-            displayframe = mdiff[pos_frames].copy()
+            predisplayframe = mdiff[pos_frames].copy()
         elif display_mode == 4:
             # optical flow
             # always compute optical flow from the original frames
-            cur = cv2.cvtColor(frames[pos_frames],cv2.COLOR_BGR2GRAY)
-            nxt = cv2.cvtColor(frames[pos_frames+1],cv2.COLOR_BGR2GRAY)
+            cur = cv2.cvtColor(frames_org[pos_frames],cv2.COLOR_BGR2GRAY)
+            nxt = cv2.cvtColor(frames_org[pos_frames+1],cv2.COLOR_BGR2GRAY)
             flow0 = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,3,3,5,1.2,cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
             flow = cv2.calcOpticalFlowFarneback(cur,nxt,flow0,0.5,3,3,3,5,1.2,cv2.OPTFLOW_USE_INITIAL_FLOW) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
             flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
@@ -392,38 +467,41 @@ while True:
             flowmag[flowmag>flowmag50] = flowmag50
             if hovering_over is not None and pos_frames in annotations:
                 an = annotations[pos_frames][hovering_over]
-                flow = flow[int(an[1]):int(an[1]+an[3]),int(an[0]):int(an[0]+an[2])]
+                pxls = norm_to_imgpix(an)
+                flow = flow[pxls[1]:(pxls[1]+pxls[3]),pxls[0]:(pxls[0]+pxls[2])]
                 flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
                 flowmag = flowmag / flowmag.max()
-                displayframe = np.zeros_like(frames[pos_frames])
-                displayframe[an[1]:an[1]+an[3],an[0]:an[0]+an[2]] = np.stack([flowmag]*3,axis=-1)
+                predisplayframe = np.zeros_like(frames[pos_frames])
+                predisplayframe[pxls[1]:(pxls[1]+pxls[3]),pxls[0]:(pxls[0]+pxls[2]),0] = np.stack([flowmag]*3,axis=-1)
             else:
                 print("flowmag max=",flowmag.max())
                 flowmag = flowmag / flowmag.max()
-                displayframe = np.stack([flowmag]*3,axis=-1)
+                predisplayframe = np.stack([flowmag]*3,axis=-1)
         elif display_mode == 5:
-            displayframe = streaks[pos_frames].copy()
-        if zoom_rect:
-            displayframe = displayframe[zy0:zy1,zx0:zx1,...]
+            predisplayframe = streaks[pos_frames].copy()
 
+        phyz = norm_to_imgpix(predisplayframe,(zx0,zy0,zx1,zy1))
+        predisplayframe = predisplayframe[phyz[1]:phyz[3],phyz[0]:phyz[2],...]
+        displayframe = cv2.resize(predisplayframe,(DISPLAY_WIDTH,DISPLAY_HEIGHT))
+        del predisplayframe 
 
-        phy_size = displayframe.shape[1],displayframe.shape[0]
-        displayframe = cv2.resize(displayframe,(DISPLAY_WIDTH,DISPLAY_HEIGHT))
-        size_ratio_x = phy_size[0] / DISPLAY_WIDTH
-        size_ratio_y = phy_size[1] / DISPLAY_HEIGHT 
+        # IMPORTANT: Pixel coordinates are now good on the displayframe image. Any calls to norm2pix/pix2norm
+        # before this point are invalid.
+        # no need to rescale zoomed-in area, since it is already in pixel coordinates.
+        # no need to rescale annotations, since they are in normalized coordinates.
+        # no need to rescale mouse coordinates, since they are in pixel coordinates.
+        # no need to rescale dragging_origin, since it is in normalized coordinates
+        # the only time we move out of normalized coordinates is when drawing to displayframe.
+    
+
         hovering_over = None
         hovering_over_quad = ""
         if pos_frames in annotations: # if there are annotations for this frame
             for ai in range(len(annotations[pos_frames])):
                 an = annotations[pos_frames][ai]
-                if not zoom_rect:
-                    ex = [int(an[0]/size_ratio_x),int(an[1]/size_ratio_y),int(an[2]/size_ratio_x),int(an[3]/size_ratio_y)]
-                    cv2.rectangle(displayframe,ex,(0,0,255),1)
-                    put_text_rect(displayframe,f"{ai}",(ex[0],ex[1]),(255,255,0),cv2.FONT_HERSHEY_DUPLEX,0.25,1,"belowtopleft",False)
-                else:
-                    ex = [int((an[0]-zx0)/size_ratio_x),int((an[1]-zy0)/size_ratio_y),int(an[2]/size_ratio_x),int(an[3]/size_ratio_y)]
-                    cv2.rectangle(displayframe,ex,(0,0,255),1)
-                    put_text_rect(displayframe,f"{ai}",(ex[0],ex[1]),(255,255,0),cv2.FONT_HERSHEY_DUPLEX,0.25,1,"belowtopleft",False)
+                pxan = norm2pix(an)
+                cv2.rectangle(displayframe,pxan,(0,0,255),1)
+                put_text_rect(displayframe,f"{ai}",(pxan[0],pxan[1]),cv2.FONT_HERSHEY_DUPLEX,0.35,(255,255,0),(0,0,0),1,anchor="top-right")
       
                 # see if we are hovering over this annotation
                 #        ex[0]  
@@ -433,48 +511,46 @@ while True:
                 #         +-----------------+ ex[1]+ex[3]
                 #         ex[0]+ex[2]
                 #
-                if mx/size_ratio_x >= ex[0] and mx/size_ratio_x <= ex[0]+ex[2] and my/size_ratio_y >= ex[1] and my/size_ratio_y <= ex[1]+ex[3]:
-                    cv2.rectangle(displayframe,ex,(255,220,220),1)
+                if nmmousex is not None and nmmousex >= an[0] and nmmousex <= an[0]+an[2] and nmmousey >= an[1] and nmmousey <= an[1]+an[3]:
+                    cv2.rectangle(displayframe,norm2pix(an),(255,220,220),1)
                     if dragging_mode:
-                        cv2.rectangle(displayframe,ex,(255,255,127),1)
+                        cv2.rectangle(displayframe,norm2pix(an),(255,255,127),1)
                     hovering_over = ai
                     # determine which diagonal-delimited quadrant the mouse is in
-                    rect_center_x = ex[0]+ex[2]//2
-                    rect_center_y = ex[1]+ex[3]//2
-                    min_width = min(ex[2],ex[3])//4
-                    dist_from_center_x = mx/size_ratio_x - rect_center_x
-                    dist_from_center_y = my/size_ratio_y - rect_center_y
+                    # these calculations are in normalized coordinates
+                    CROSS_COLOR = (0,50,255)
+                    rect_center_x = an[0]+an[2]/2
+                    rect_center_y = an[1]+an[3]/2
+                    min_width = min(an[2],an[3])/4
+                    dist_from_center_x = nmmousex - rect_center_x
+                    dist_from_center_y = nmmousey - rect_center_y
                     dist_from_center = np.sqrt(dist_from_center_x**2 + dist_from_center_y**2)
+                    px = norm2pix(an)
                     if dist_from_center < min_width:
-                        #cv2.putText(displayframe,"C",(ex[0]+ex[2]//2,ex[1]+ex[3]//2),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
-                        cv2.drawMarker(displayframe,(ex[0]+ex[2]//2,ex[1]+ex[3]//2),(255,255,255),cv2.MARKER_CROSS,10,2)
+                        cv2.drawMarker(displayframe,norm2pix((an[0]+an[2]/2,an[1]+an[3]/2)),CROSS_COLOR,cv2.MARKER_CROSS,10,2)
                         hovering_over_quad = "C"
-                    elif mx/size_ratio_x < ex[0]+ex[2]//2:
-                        if my/size_ratio_y < ex[1]+ex[3]//2:
-                            #cv2.putText(displayframe,"NW",(ex[0],ex[1]),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
-                            cv2.drawMarker(displayframe,(ex[0],ex[1]),(255,255,255),cv2.MARKER_CROSS,10,2)
+                    elif nmmousex < an[0]+an[2]/2:
+                        if nmmousey < an[1]+an[3]/2:
+                            cv2.drawMarker(displayframe,(px[0],px[1]),CROSS_COLOR,cv2.MARKER_CROSS,10,2)
                             hovering_over_quad = "NW"
                         else:
-                            #cv2.putText(displayframe,"SW",(ex[0],ex[1]+ex[3]),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
-                            cv2.drawMarker(displayframe,(ex[0],ex[1]+ex[3]-1),(255,255,255),cv2.MARKER_CROSS,10,2)
+                            cv2.drawMarker(displayframe,(px[0],px[1]+px[3]-1),CROSS_COLOR,cv2.MARKER_CROSS,10,2)
                             hovering_over_quad = "SW"
-                    else:
-                        if my/size_ratio_y < ex[1]+ex[3]//2:
-                            #cv2.putText(displayframe,"NE",(ex[0]+ex[2],ex[1]),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
-                            cv2.drawMarker(displayframe,(ex[0]+ex[2]-1,ex[1]),(255,255,255),cv2.MARKER_CROSS,10,2)
+                    else: # nmmousex >= ex[0]+ex[2]//2
+                        if nmmousey < an[1]+an[3]/2:
+                            cv2.drawMarker(displayframe,(px[0]+px[2]-1,px[1]),CROSS_COLOR,cv2.MARKER_CROSS,10,2)
                             hovering_over_quad = "NE"
                         else:
-                            #cv2.putText(displayframe,"SE",(ex[0]+ex[2],ex[1]+ex[3]),cv2.FONT_HERSHEY_DUPLEX,1,(255,255,255),2)
-                            cv2.drawMarker(displayframe,(ex[0]+ex[2]-1,ex[1]+ex[3]-1),(255,255,255),cv2.MARKER_CROSS,10,2)
+                            cv2.drawMarker(displayframe,(px[0]+px[2]-1,px[1]+px[3]-1),CROSS_COLOR,cv2.MARKER_CROSS,10,2)
                             hovering_over_quad = "SE"
                     if deleting_mode:
                         if flash:
-                            put_text_rect(displayframe,"delete(y/n)",(ex[0],ex[1]),(0,127,255), cv2.FONT_HERSHEY_DUPLEX,0.5,1)
+                            put_text_rect(displayframe,"delete(y/n)",(px[0],px[1]),cv2.FONT_HERSHEY_DUPLEX,0.5,(0,127,255),(0,0,0),1, anchor="bottom-left")
                     else:
-                        put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}",(ex[0],ex[1]),(255,255,255),cv2.FONT_HERSHEY_DUPLEX,0.5,1)
+                        #old: put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}{hovering_over_quad}",(ex[0],ex[1]),(255,255,255),cv2.FONT_HERSHEY_DUPLEX,0.5,1)
+                        put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}{hovering_over_quad}",norm2pix((an[0],an[1])),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),(0,0,0),1,anchor="bottom-left")
                 '''
                 if mx >= ex0 and mx <= ex1 and my >= ey0 and my <= ey1:
-                    flash = (int(time.time()*3)%2) > 0
                     print(f"flash={flash}")
                     bdr = 1 if zoom_rect else 1
                     color = (0,255,255) if deleting_mode and flash else (0,0,255)
@@ -490,7 +566,14 @@ while True:
                         int(ey1/size_ratio_y)),color,0.3,bdr)
                     break
                     '''
-        cv2.putText(displayframe,f"{findex:04d}:{pos_frames:03d}{deleting_mode}{deleting_ann}",(10,30),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),1,cv2.LINE_AA)
+        cv2.putText(displayframe,f"{findex:04d}:{labelsfi}:{pos_frames:03d}:{deleting_mode}:{deleting_ann}",(10,30),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),1,cv2.LINE_AA)
+        '''
+        if creating_mode:
+            cv2.line(displayframe,
+                    norm2pix((rx0,ry0)),
+                    norm2pix((mousex,mousey)),
+                (255,255,255),1)
+        '''
         cv2.imshow('frame', displayframe)
         # print(f"frame redrawn: pos_frames={pos_frames}")
         # check for keyboard events
@@ -528,7 +611,10 @@ while True:
             break
 
         elif k == 27:  # escape key
-            zoom_rect = False
+            zx0 = 0
+            zy0 = 0
+            zx1 = 1.0
+            zy1 = 1.0
         elif k == ord(' '):
             pause_mode = not pause_mode
         elif k == ord(','):
@@ -544,14 +630,15 @@ while True:
         elif k == ord('o'):
             if pos_frames+1 < frames.shape[0] and hovering_over is not None and pos_frames in annotations:
                 print(f"applying optical flow to rectangle {hovering_over}")
-                cur = frames[pos_frames][...,1]
-                nxt = frames[pos_frames+1][...,1]
+                cur = frames_org[pos_frames][...,1]
+                nxt = frames_org[pos_frames+1][...,1]
                 #cur = cv2.cvtColor(frames[pos_frames],cv2.COLOR_BGR2GRAY)
                 #nxt = cv2.cvtColor(frames[pos_frames+1],cv2.COLOR_BGR2GRAY)
                 flow = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,1,3,5,1.2,0) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
                 flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
                 an = annotations[pos_frames][hovering_over]
-                flow = flow[int(an[1]):int(an[1]+an[3]),int(an[0]):int(an[0]+an[2])]
+                pyx = norm_to_imgpix(flow,an)
+                flow = flow[int(pyx[1]):int(pyx[1]+pyx[3]),int(pyx[0]):int(pyx[0]+pyx[2])]
                 fs = flow.shape
                 flow=flow[fs[0]//4:fs[0]*3//4,fs[1]//4:fs[1]*3//4]
                 # compute mean of flow over rectangle
@@ -590,13 +677,15 @@ while True:
                     #deleting_ann = None
                     # write to file
                     # must rewrite the entire file
+                    ww=frames.shape[2]
+                    wh=frames.shape[1]
                     open(labelsfi,"w").write("")
                     for p_frames in annotations:
                         for ai in range(len(annotations[p_frames])):
                             if p_frames == pos_frames and ai == deleting_ann:
                                 continue
                             an = annotations[p_frames][ai]
-                            yoloroi = list(rect2yolo(an,ww,wh))
+                            yoloroi = list(rect2yolo(an))
                             open(labelsfi,"a").write(f"{p_frames} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
                     # save pos_frames
                     open("posframes.txt","w").write(f"{pos_frames}")
@@ -683,7 +772,7 @@ while True:
             for p_frames in annotations:
                 for ai in range(len(annotations[p_frames])):
                     an = annotations[p_frames][ai]
-                    yoloroi = list(rect2yolo(an,ww,wh))
+                    yoloroi = list(rect2yolo(an))
                     open(labelsfi,"a").write(f"{p_frames} 0 {yoloroi[0]} {yoloroi[1]} {yoloroi[2]} {yoloroi[3]}\n")
             save_flag = False
 
@@ -696,150 +785,125 @@ while True:
 
         if mevent is not None:
             event = mevent['e']
-            mx = mevent['x']
-            my = mevent['y']
-            print(f"mouse event = {event} ({mx},{my})")
-            if event==cv2.EVENT_MBUTTONDOWN and mdblclk:
-                mdblclk = False
-            elif event==cv2.EVENT_MBUTTONDOWN:
-                print(f"clicked {mevent['x']},{mevent['y']}")
-                if zoom_rect:
-                    # already zoomed, make rectangle
-                    mx = mx + zx0
-                    my = my + zy0
+            rawmousex = mevent['x']
+            rawmousey = mevent['y']
+            nmmousex,nmmousey = imgpix_to_norm(displayframe, (rawmousex,rawmousey))
+            pxmousex,pxmousey = norm2pix((nmmousex,nmmousey))
+            print(f"mouse event = {event} ({rawmousex:.04f},{rawmousey:0.04f}) ({nmmousex:.04f},{nmmousey:.04f}) ({pxmousex},{pxmousey})")
+            if event==cv2.EVENT_MBUTTONDOWN:
+                # poor man's zoom until we move to Qt or whatever.
+                print(f"clicked.")
+                pxrectwidth = DISPLAY_WIDTH//2
+                pxrectheight = DISPLAY_HEIGHT//2
+
+                pxrectx = pxmousex//2
+                pxrecty = pxmousey//2
+                zx0,zy0,zx1,zy1 = pix2norm((pxrectx,pxrecty,pxrectx+pxrectwidth,pxrecty+pxrectheight))
+                print(f"zoomed to ({zx0:.03f},{zy0:.03f}),({zx1:.03f},{zy1:.03f})")
+                '''
                 # establish rectangle
-                xbound = frames[0].shape[1]
-                ybound = frames[0].shape[0]
-                zx0 = int(mx-120)
-                zx1 = int(mx+120)
-                zy0 = int(my-80)
-                zy1 = int(my+80)
-                if zx0 < 0:
-                    zx1 -= zx0
-                    zx0 -= zx0
-                if zy0 < 0:
-                    zy1 -= zy0
-                    zy0 -= zy0
-                if zx1 >= xbound:
-                    zx0 -= zx1 - xbound-1
-                    zx1 -= zx1 - xbound-1
-                if zy1 >= ybound:
-                    zy0 -= zy1 - ybound-1
-                    zy1 -= zy1 - ybound-1
+                pxxbound = frames[0].shape[1]
+                pxybound = frames[0].shape[0]
+                pxzx0 = int(pxmousex-120)
+                pxzx1 = int(pxmousex+120)
+                pxzy0 = int(pxmousey-80)
+                pxzy1 = int(pxmousey+80)
+                if pxzx0 < 0:
+                    pxzx1 -= pxzx0
+                    pxzx0 -= pxzx0
+                if pxzy0 < 0:
+                    pxzy1 -= pxzy0
+                    pxzy0 -= pxzy0
+                if pxzx1 >= pxxbound:
+                    pxzx0 -= pxzx1 - pxxbound-1
+                    pxzx1 -= pxzx1 - pxxbound-1
+                if pxzy1 >= pxybound:
+                    pxzy0 -= pxzy1 - pxybound-1
+                    pxzy1 -= pxzy1 - pxybound-1
 
-                zoom_rect = True
-            elif event == cv2.EVENT_MBUTTONDBLCLK:
-                zoom_rect = False
-                mdblclk = True
+                zx0,zy0,zx1,zy1 = pix2norm((pxzx0,pxzy0,pxzx1,pxzy1))
+                '''
             elif event == cv2.EVENT_MOUSEMOVE:
-                if dragging_mode:
-                    if dragging_ann is not None:
-                        if hovering_over_quad == "C":
-                            annotations[pos_frames][dragging_ann][0] += mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][1] += my-dragging_origin_y
-                        elif hovering_over_quad == "NW":
-                            annotations[pos_frames][dragging_ann][0] += mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][1] += my-dragging_origin_y
-                            annotations[pos_frames][dragging_ann][2] -= mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][3] -= my-dragging_origin_y
-                        elif hovering_over_quad == "NE":
-                            annotations[pos_frames][dragging_ann][2] += mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][1] += my-dragging_origin_y
-                            annotations[pos_frames][dragging_ann][3] -= my-dragging_origin_y
-                        elif hovering_over_quad == "SW":
-                            annotations[pos_frames][dragging_ann][3] += my-dragging_origin_y
-                            annotations[pos_frames][dragging_ann][0] += mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][2] -= mx-dragging_origin_x
-                        elif hovering_over_quad == "SE":
-                            annotations[pos_frames][dragging_ann][2] += mx-dragging_origin_x
-                            annotations[pos_frames][dragging_ann][3] += my-dragging_origin_y
-                        annotations[pos_frames][dragging_ann][0] = np.clip(annotations[pos_frames][dragging_ann][0],0,frames[0].shape[1]-5)
-                        annotations[pos_frames][dragging_ann][1] = np.clip(annotations[pos_frames][dragging_ann][1],0,frames[0].shape[0]-5)
-                        annotations[pos_frames][dragging_ann][2] = np.clip(annotations[pos_frames][dragging_ann][2],10,frames[0].shape[1]-5)
-                        annotations[pos_frames][dragging_ann][3] = np.clip(annotations[pos_frames][dragging_ann][3],10,frames[0].shape[0]-5)
+                if creating_mode:
+                    #if we've dragged more than 5 pixels, create a new annotation
+                    print(f"dragging ({dragging_origin_x},{dragging_origin_y}),({nmmousex},{nmmousey})")
+                    #cv2.line(displayframe,(dragging_origin_x,dragging_origin_y),(mx,my),(255,255,255),1)
+                    # if we've dragged more than 20 pixels, create a new annotation
+                    # must first convert both dragging_origin to pixel coordinates
+                    pxdx,pxdy = norm2pix((dragging_origin_x,dragging_origin_y))
+                    if abs(pxmousex-pxdx) > 20 or abs(pxmousey-pxdy) > 20:
+                        # establish the new annotation rectangle
+                        # different rules depending on what direction we dragged
+                        if nmmousex < dragging_origin_x:
+                            if nmmousey < dragging_origin_y:
+                                newan = [nmmousex,nmmousey,dragging_origin_x-nmmousex,dragging_origin_y-nmousey]
+                            else:
+                                newan = [nmmousex,dragging_origin_y,dragging_origin_x-nmmousex,nmmousey-dragging_origin_y]
+                        else:
+                            if nmmousey < dragging_origin_y:
+                                newan = [dragging_origin_x,nmmousey,nmmousex-dragging_origin_x,dragging_origin_y-nmmousey]
+                            else:
+                                newan = [dragging_origin_x,dragging_origin_y,nmmousex-dragging_origin_x,nmmousey-dragging_origin_y]
+                        if pos_frames in annotations:
+                            annotations[pos_frames].append(newan)
+                        else:
+                            annotations[pos_frames] = [ newan ]
+                        save_flag = True
+                        creating_mode = False
+                        dragging_mode = True
+                        dragging_ai = len(annotations[pos_frames])-1
+                        dragging_origin_x = nmmousex
+                        dragging_origin_y = nmmousey
 
-                        dragging_origin_x = mx
-                        dragging_origin_y = my
+                if dragging_mode:
+                    if dragging_ai is not None:
+                        if hovering_over_quad == "C":
+                            annotations[pos_frames][dragging_ai][0] += nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][1] += nmmousey-dragging_origin_y
+                        elif hovering_over_quad == "NW":
+                            annotations[pos_frames][dragging_ai][0] += nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][1] += nmmousey-dragging_origin_y
+                            annotations[pos_frames][dragging_ai][2] -= nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][3] -= nmmousey-dragging_origin_y
+                        elif hovering_over_quad == "NE":
+                            annotations[pos_frames][dragging_ai][2] += nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][1] += nmmousey-dragging_origin_y
+                            annotations[pos_frames][dragging_ai][3] -= nmmousey-dragging_origin_y
+                        elif hovering_over_quad == "SW":
+                            annotations[pos_frames][dragging_ai][3] += nmmousey-dragging_origin_y
+                            annotations[pos_frames][dragging_ai][0] += nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][2] -= nmmousex-dragging_origin_x
+                        elif hovering_over_quad == "SE":
+                            annotations[pos_frames][dragging_ai][2] += nmmousex-dragging_origin_x
+                            annotations[pos_frames][dragging_ai][3] += nmmousey-dragging_origin_y
+                        annotations[pos_frames][dragging_ai][0] = np.clip(annotations[pos_frames][dragging_ai][0],0,1)
+                        annotations[pos_frames][dragging_ai][1] = np.clip(annotations[pos_frames][dragging_ai][1],0,1)
+                        annotations[pos_frames][dragging_ai][2] = np.clip(annotations[pos_frames][dragging_ai][2],0,1)
+                        annotations[pos_frames][dragging_ai][3] = np.clip(annotations[pos_frames][dragging_ai][3],0,1)
+
+                        dragging_origin_x,dragging_origin_y = (nmmousex,nmmousey)
                         save_flag = True
             elif event == cv2.EVENT_LBUTTONDOWN:
                 # if we are hovering over an annotation, start dragging it
                 if hovering_over is not None and hovering_over >= 0 and hovering_over < len(annotations[pos_frames]):
                     dragging_mode = True
-                    dragging_ann = hovering_over
-                    dragging_origin_x = mx
-                    dragging_origin_y = my
+                    dragging_ai = hovering_over
+                    dragging_origin_x = nmmousex
+                    dragging_origin_y = nmmousey
                 else:
                     # create a new annotation
                     # clear out any dragging mode info
+                    # and replace with current needed values.
                     dragging_mode = False
-                    dragging_ann = None
-                    # establish the new annotation rectangle
-                    newan = [mx-8,my-8,12,12]
-                    if zoom_rect:
-                        newan[0] += zx0
-                        newan[1] += zy0
-                    if pos_frames in annotations:
-                        annotations[pos_frames].append(newan)
-                    else:
-                        annotations[pos_frames] = [ newan ]
-                    save_flag = True
-                    dragging_mode = True
-                    dragging_ann = len(annotations[pos_frames])-1
-                    dragging_origin_x = mx
-                    dragging_origin_y = my
-
+                    dragging_ai = None
+                    dragging_origin_x,dragging_origin_y = nmmousex,nmmousey
+                    creating_mode = True
 
             elif event == cv2.EVENT_LBUTTONUP:
                 dragging_mode = False
-                dragging_ann = None
+                creating_mode = False
+                dragging_ai = None
 
-        heywood = 0
-        """
-        if mevent is not None:
-            if mevent['e'] == cv2.EVENT_MOUSEMOVE:
-                if dragging_mode:
-                    rx1 = mevent['x']
-                    ry1 = mevent['y']
-                while True:
-                    try:
-                        mevent = mouseq.get_nowait()
-                    except queue.Empty:
-                        break
-                    if mevent['e'] == cv2.EVENT_MOUSEMOVE:
-                        if dragging_mode:
-                            rx1 = mevent['x']
-                            ry1 = mevent['y']
-                    else:
-                        break
-
-        if mevent is not None:
-            if mevent['e'] == cv2.EVENT_LBUTTONDOWN:
-                # establish rectangle
-                rx0 = np.clip(mevent['x']-50,0,frame.shape[1]-1)
-                rx1 = np.clip(mevent['x']+50,0,frame.shape[1]-1)
-                ry0 = np.clip(mevent['y']-50,0,frame.shape[0]-1)
-                ry1 = np.clip(mevent['y']+50,0,frame.shape[0]-1)
-                opt_flow(frames,pos_frames, (rx0,ry0),(rx1,ry1))
-
-            elif mevent['e'] == cv2.EVENT_MOUSEMOVE:
-                rx1 = mevent['x']
-                ry1 = mevent['y']
-            elif mevent['e'] == cv2.EVENT_LBUTTONUP:
-                dragging_mode = False
-            elif mevent['e'] == cv2.EVENT_MBUTTONDOWN:
-                rect_mode = False
-            elif mevent['e'] == cv2.EVENT_MBUTTONDBLCLK:
-                pass
-        if (not pause_mode) or one_shot:
-            if pos_frames < len(frames)-2:
-                pos_frames += 1
-            else:
-                pos_frames = 0
-            frame = frames[pos_frames].copy()
-        one_shot = False
-        if not dragging_mode:
-            time.sleep(0.0)
-        """
         if not pause_mode:
             pos_frames += 1
             if pos_frames >= len(frames):
