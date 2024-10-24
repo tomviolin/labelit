@@ -84,6 +84,8 @@ save_flag = False
 # pixels:     0------------------------------------DISPLAY_WIDTH
 # zoom normalized: zx0-----------------------------zx1
 
+# the transformation functions are:
+
 # norm_to_pix = lambda x: int(x*DISPLAY_WIDTH)
 # pix_to_norm = lambda x: x/DISPLAY_WIDTH
 # when zoomed in:
@@ -95,7 +97,19 @@ zy0 = 0
 zx1 = 1.0
 zy1 = 1.0
 
-def norm2pix(rect):
+# examples to verify the correctness of the transformation functions
+# print(norm_to_pix(0.5)) # should be DISPLAY_WIDTH//2
+# print(pix_to_norm(DISPLAY_WIDTH//2)) # should be 0.5
+# print(zoomed_norm_to_pix(0.5)) # should be DISPLAY_WIDTH//2
+# print(zoomed_pix_to_norm(DISPLAY_WIDTH//2)) # should be 0.5
+
+
+
+def norm2pix(nmrect):
+    if len(nmrect) == 4:
+        rect = (nmrect[0],nmrect[1],nmrect[0]+nmrect[2],nmrect[1]+nmrect[3])
+    else:
+        rect=nmrect
     # this should work for points or rectangles,
     # and it will work for x,y,w,h or x0,y0,x1,y1 formats
     if displayframe is None or displayframe.shape[0:2] != (DISPLAY_HEIGHT,DISPLAY_WIDTH):
@@ -105,16 +119,33 @@ def norm2pix(rect):
     # always take zoomed-in area into account
     for i in range(len(rect)):
         if i % 2 == 0:
-            retv.append(int((rect[i]-zx0)/(zx1-zx0)*DISPLAY_WIDTH))
+            # retv.append((pixrect[i]/DISPLAY_WIDTH*(zx1-zx0)+zx0))
+            # break down order of operations of above formula:
+            # 1. rect[i]/DISPLAY_WIDTH
+            # 2. (result of 1)*(zx1-zx0) 
+            # 3. (result of 2)+zx0 
+            # now reverse the operations to get the inverse formula:
+            retv.append(int(((rect[i]-zx0)/(zx1-zx0))*DISPLAY_WIDTH))
         else:
-            retv.append(int((rect[i]-zy0)/(zy1-zy0)*DISPLAY_HEIGHT))
+            retv.append(int(((rect[i]-zy0)/(zy1-zy0))*DISPLAY_HEIGHT))
 
-    return tuple(retv)
-    # ba da bing!
+    if len(nmrect) == 4:
+        return retv[0],retv[1],retv[2]-retv[0],retv[3]-retv[1]
+    else:
+        return tuple(retv)
+    return 
 
 frames_to_read = None
 frames_to_skip = None
 
+
+# norm: 0.0--------zx0-nm0----nm1--zx1-------1.0
+
+# pix:  0-----px0---px1---DISPLAY_WIDTH
+
+
+# px0 formula: px0 = (nm0-zx0)/(zx1-zx0)*DISPLAY_WIDTH
+# nm0 formula: nm0 = px0/DISPLAY_WIDTH*(zx1-zx0)+zx0
 
 def pix2norm(pixrect):
     # this should work for points or rectangles,
@@ -122,14 +153,22 @@ def pix2norm(pixrect):
     if displayframe is None or displayframe.shape[0:2] != (DISPLAY_HEIGHT,DISPLAY_WIDTH):
         print(f"illegal call to pix2norm: displayframe not initialized")
         exit()
+    if len(pixrect) == 4:
+        rect = (pixrect[0],pixrect[1],pixrect[0]+pixrect[2],pixrect[1]+pixrect[3])
+    else:
+        rect=list(pixrect)
     retv = []
     # always take zoomed-in area into account
     for i in range(len(pixrect)):
         if i % 2 == 0:
-            retv.append((pixrect[i]/DISPLAY_WIDTH + zx0) * (zx1-zx0))
+            retv.append((rect[i]/DISPLAY_WIDTH*(zx1-zx0)+zx0))
         else:
-            retv.append((pixrect[i]/DISPLAY_HEIGHT + zy0) * (zy1-zy0))
-    return tuple(retv)
+            retv.append((rect[i]/DISPLAY_HEIGHT*(zy1-zy0)+zy0))
+
+    if len(pixrect) == 4:
+        return retv[0],retv[1],retv[2]-retv[0],retv[3]-retv[1]
+    else:
+        return tuple(retv)
 
 
 def norm_to_imgpix(img,rect):
@@ -151,7 +190,7 @@ def imgpix_to_norm(img,rect):
     return tuple(retv)
 
 
-
+'''
 def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
     # This is a low-level function that only operates on pixel coordinates.  
     #   The caller is responsible for any conversions.
@@ -164,7 +203,7 @@ def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
     cv2.rectangle(imgcopy,(rx0,ry0),(rx1,ry1),color,border)
     cv2.addWeighted(imgcopy, alpha, img, 1-alpha, 0, img)
     return imgcopy
-
+'''
 
 
 STREAKING=False
@@ -175,11 +214,6 @@ def sigmoid(x):
 
 
 
-frames_to_read = 10
-frames_to_skip = 5
-if hires_mode:
-    frames_to_read = 999
-    frames_to_skip =1 
 
 
 
@@ -238,13 +272,22 @@ fdf_labels = [ fi.replace("/corrected/","/labels/").replace("_corrected","").rep
 # MOUSE EVENT QUEUE
 mouseq = queue.Queue()
 def mouse_event(e, x,y,flags,param):
-    mouseq.put_nowait({"e":e, "x":(x/(zx1-zx0)+zx0), "y":(y/(zy1-zy0)+zy0), "flags":flags, "param":param})
+    # print(f"mouse_event({e},{x},{y},{flags},{param})")
+    # always return raw mouse coordinates ~= pixel coordinates
+    mouseq.put_nowait({"e":e, "x":x, "y":y, "flags":flags, "param":param})
+    return True
+
 # END MOUSE EVENT QUEUE
 window_setup = False
 findex = 0
 if os.path.exists("findex.txt"):
     findex = int(open("findex.txt").read())
 while True:
+    frames_to_read = 150
+    frames_to_skip = 1
+    if hires_mode:
+        frames_to_read = 999
+        frames_to_skip =1 
     if findex < 0:
         findex = 0
     if findex >= len(fdf_filenames):
@@ -430,6 +473,7 @@ while True:
     pos_frames = 0
     if os.path.exists("posframes.txt"):
         pos_frames = int(open("posframes.txt").read())
+    pos_frames = np.clip(pos_frames,0,frames.shape[0]-1)
     ok = True
     if STREAKING:
         num_display_modes = 6
@@ -439,9 +483,9 @@ while True:
         flash = (int(time.time()*3)%2) > 0
         if window_setup==False:
             print(f"setting up GUI")
-            cv2.namedWindow('frame' , cv2.WINDOW_NORMAL)
+            cv2.namedWindow('frame' , cv2.WINDOW_GUI_NORMAL)
             cv2.resizeWindow('frame', DISPLAY_WIDTH, DISPLAY_HEIGHT+64)
-            cv2.moveWindow('frame', 150, 5)
+            cv2.moveWindow('frame', 150, 15)
             cv2.setMouseCallback('frame',mouse_event)
             window_setup = True
         #print(f"pos_frames={pos_frames}")
@@ -459,6 +503,7 @@ while True:
             # always compute optical flow from the original frames
             cur = cv2.cvtColor(frames_org[pos_frames],cv2.COLOR_BGR2GRAY)
             nxt = cv2.cvtColor(frames_org[pos_frames+1],cv2.COLOR_BGR2GRAY)
+
             flow0 = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,3,3,5,1.2,cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
             flow = cv2.calcOpticalFlowFarneback(cur,nxt,flow0,0.5,3,3,3,5,1.2,cv2.OPTFLOW_USE_INITIAL_FLOW) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
             flowmag = np.sqrt(flow[...,0]**2+flow[...,1]**2)
@@ -485,8 +530,9 @@ while True:
         displayframe = cv2.resize(predisplayframe,(DISPLAY_WIDTH,DISPLAY_HEIGHT))
         del predisplayframe 
 
-        # IMPORTANT: Pixel coordinates are now good on the displayframe image. Any calls to norm2pix/pix2norm
-        # before this point are invalid.
+        # IMPORTANT: Pixel coordinates are now good on the displayframe image. 
+        #
+        # Any calls to norm2pix/pix2norm before this point are invalid.
         # no need to rescale zoomed-in area, since it is already in pixel coordinates.
         # no need to rescale annotations, since they are in normalized coordinates.
         # no need to rescale mouse coordinates, since they are in pixel coordinates.
@@ -500,6 +546,7 @@ while True:
             for ai in range(len(annotations[pos_frames])):
                 an = annotations[pos_frames][ai]
                 pxan = norm2pix(an)
+                # print(f"an={an}  pxan={pxan}")
                 cv2.rectangle(displayframe,pxan,(0,0,255),1)
                 put_text_rect(displayframe,f"{ai}",(pxan[0],pxan[1]),cv2.FONT_HERSHEY_DUPLEX,0.35,(255,255,0),(0,0,0),1,anchor="top-right")
       
@@ -548,33 +595,20 @@ while True:
                             put_text_rect(displayframe,"delete(y/n)",(px[0],px[1]),cv2.FONT_HERSHEY_DUPLEX,0.5,(0,127,255),(0,0,0),1, anchor="bottom-left")
                     else:
                         #old: put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}{hovering_over_quad}",(ex[0],ex[1]),(255,255,255),cv2.FONT_HERSHEY_DUPLEX,0.5,1)
-                        put_text_rect(displayframe,f"hov: {pos_frames}:{hovering_over}{hovering_over_quad}",norm2pix((an[0],an[1])),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),(0,0,0),1,anchor="bottom-left")
-                '''
-                if mx >= ex0 and mx <= ex1 and my >= ey0 and my <= ey1:
-                    print(f"flash={flash}")
-                    bdr = 1 if zoom_rect else 1
-                    color = (0,255,255) if deleting_mode and flash else (0,0,255)
-                    cv2.rectangle(displayframe,(
-                            int(ex0/size_ratio_x),int(ey0/size_ratio_y),
-                        ),(
-                            int(ex1/size_ratio_x),int(ey1/size_ratio_y),
-                        ),color,bdr)
-                    rect_transp_fill(displayframe,(
-                        int(ex0/size_ratio_x),
-                        int(ey0/size_ratio_y),
-                        int(ex1/size_ratio_x),
-                        int(ey1/size_ratio_y)),color,0.3,bdr)
-                    break
-                    '''
+                        put_text_rect(displayframe,
+                                f"hov: {pos_frames}:{hovering_over}{hovering_over_quad}",
+                                norm2pix((an[0],an[1])),
+                                cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),(0,0,0),1,
+                                anchor="bottom-left")
         cv2.putText(displayframe,f"{findex:04d}:{labelsfi}:{pos_frames:03d}:{deleting_mode}:{deleting_ann}",(10,30),cv2.FONT_HERSHEY_DUPLEX,0.5,(255,255,255),1,cv2.LINE_AA)
-        '''
-        if creating_mode:
-            cv2.line(displayframe,
-                    norm2pix((rx0,ry0)),
-                    norm2pix((mousex,mousey)),
-                (255,255,255),1)
-        '''
+        # crosshair
+        if pxmousex is not None and pxmousey is not None:
+            displayframe[pxmousey,...] =  1.0 - displayframe[pxmousey,...]
+            displayframe[:,pxmousex,...] = 1.0 - displayframe[:,pxmousex,...]
         cv2.imshow('frame', displayframe)
+
+        one_pixel = (zx1-zx0)/DISPLAY_WIDTH
+
         # print(f"frame redrawn: pos_frames={pos_frames}")
         # check for keyboard events
         k = cv2.waitKeyEx(1) # & 0xFF
@@ -632,6 +666,8 @@ while True:
                 print(f"applying optical flow to rectangle {hovering_over}")
                 cur = frames_org[pos_frames][...,1]
                 nxt = frames_org[pos_frames+1][...,1]
+                maxall = np.max([cur.max(),nxt.max()])
+
                 #cur = cv2.cvtColor(frames[pos_frames],cv2.COLOR_BGR2GRAY)
                 #nxt = cv2.cvtColor(frames[pos_frames+1],cv2.COLOR_BGR2GRAY)
                 flow = cv2.calcOpticalFlowFarneback(cur,nxt,None,0.5,3,1,3,5,1.2,0) #cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
@@ -640,15 +676,17 @@ while True:
                 pyx = norm_to_imgpix(flow,an)
                 flow = flow[int(pyx[1]):int(pyx[1]+pyx[3]),int(pyx[0]):int(pyx[0]+pyx[2])]
                 fs = flow.shape
-                flow=flow[fs[0]//4:fs[0]*3//4,fs[1]//4:fs[1]*3//4]
+                #flow=flow[fs[0]//4:fs[0]*3//4,fs[1]//4:fs[1]*3//4]
                 # compute mean of flow over rectangle
-                flowx = np.quantile(flow[...,0],0.970)
-                flowy = np.quantile(flow[...,1],0.970)
+                #flowx = np.mean(flow[...,0]) * DISPLAY_WIDTH
+                #flowy = np.mean(flow[...,1]) * DISPLAY_HEIGHT
+                flowx = np.quantile(flow[...,0],0.990)
+                flowy = np.quantile(flow[...,1],0.990)
                 print(f"flowx={flowx}, flowy={flowy}")
                 # apply flow to rectangle
                 newan = an.copy()
-                newan[0] -= flowx * frames.shape[2]*500.0
-                newan[1] -= flowy * frames.shape[1]*500.0
+                newan[0] += flowx
+                newan[1] += flowy
                 if pos_frames+1 in annotations:
                     annotations[pos_frames+1].append(newan)
                 else:
@@ -694,75 +732,75 @@ while True:
 
         elif (k == 81 or k == 65361 or k == ord('a')) and hovering_over is not None: # left arrow
             if hovering_over_quad == "C":
-                annotations[pos_frames][hovering_over][0] -= 1
+                annotations[pos_frames][hovering_over][0] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "NW":
-                annotations[pos_frames][hovering_over][0] -= 1
-                annotations[pos_frames][hovering_over][2] += 1
+                annotations[pos_frames][hovering_over][0] -= one_pixel
+                annotations[pos_frames][hovering_over][2] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "NE":
-                annotations[pos_frames][hovering_over][2] -= 1
+                annotations[pos_frames][hovering_over][2] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "SW":
-                annotations[pos_frames][hovering_over][0] -= 1
-                annotations[pos_frames][hovering_over][2] += 1
+                annotations[pos_frames][hovering_over][0] -= one_pixel
+                annotations[pos_frames][hovering_over][2] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "SE":
-                annotations[pos_frames][hovering_over][2] -= 1
+                annotations[pos_frames][hovering_over][2] -= one_pixel
                 save_flag = True
         elif (k == 83 or k == 65363 or k == ord('d')) and hovering_over is not None: # right arrow
             if hovering_over_quad == "C":
-                annotations[pos_frames][hovering_over][0] += 1
+                annotations[pos_frames][hovering_over][0] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "NW":
-                annotations[pos_frames][hovering_over][0] += 1
-                annotations[pos_frames][hovering_over][2] -= 1
+                annotations[pos_frames][hovering_over][0] += one_pixel
+                annotations[pos_frames][hovering_over][2] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "NE":
-                annotations[pos_frames][hovering_over][2] += 1
+                annotations[pos_frames][hovering_over][2] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "SW":
-                annotations[pos_frames][hovering_over][0] += 1
-                annotations[pos_frames][hovering_over][2] -= 1
+                annotations[pos_frames][hovering_over][0] += one_pixel
+                annotations[pos_frames][hovering_over][2] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "SE":
-                annotations[pos_frames][hovering_over][2] += 1
+                annotations[pos_frames][hovering_over][2] += one_pixel
                 save_flag = True
         elif (k == 84 or k == 65364 or k == ord('s')) and hovering_over is not None: # down arrow
             if hovering_over_quad == "C":
-                annotations[pos_frames][hovering_over][1] += 1
+                annotations[pos_frames][hovering_over][1] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "NW":
-                annotations[pos_frames][hovering_over][1] += 1
-                annotations[pos_frames][hovering_over][3] -= 1
+                annotations[pos_frames][hovering_over][1] += one_pixel
+                annotations[pos_frames][hovering_over][3] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "NE":
-                annotations[pos_frames][hovering_over][1] += 1
-                annotations[pos_frames][hovering_over][3] -= 1
+                annotations[pos_frames][hovering_over][1] += one_pixel
+                annotations[pos_frames][hovering_over][3] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "SW":
-                annotations[pos_frames][hovering_over][3] += 1
+                annotations[pos_frames][hovering_over][3] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "SE":
-                annotations[pos_frames][hovering_over][3] += 1
+                annotations[pos_frames][hovering_over][3] += one_pixel
                 save_flag = True
         elif (k == 82 or k == 65362 or k == ord('w')) and hovering_over is not None: # up arrow
             if hovering_over_quad == "C":
-                annotations[pos_frames][hovering_over][1] -= 1
+                annotations[pos_frames][hovering_over][1] -= one_pixel
                 save_flag = True
             if hovering_over_quad == "NW":
-                annotations[pos_frames][hovering_over][1] -= 1
-                annotations[pos_frames][hovering_over][3] += 1
+                annotations[pos_frames][hovering_over][1] -= one_pixel
+                annotations[pos_frames][hovering_over][3] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "NE":
-                annotations[pos_frames][hovering_over][1] -= 1
-                annotations[pos_frames][hovering_over][3] += 1
+                annotations[pos_frames][hovering_over][1] -= one_pixel
+                annotations[pos_frames][hovering_over][3] += one_pixel
                 save_flag = True
             elif hovering_over_quad == "SW":
-                annotations[pos_frames][hovering_over][3] -= 1
+                annotations[pos_frames][hovering_over][3] -= one_pixel
                 save_flag = True
             elif hovering_over_quad == "SE":
-                annotations[pos_frames][hovering_over][3] -= 1
+                annotations[pos_frames][hovering_over][3] -= one_pixel
                 save_flag = True
             
 
@@ -787,42 +825,31 @@ while True:
             event = mevent['e']
             rawmousex = mevent['x']
             rawmousey = mevent['y']
-            nmmousex,nmmousey = imgpix_to_norm(displayframe, (rawmousex,rawmousey))
-            pxmousex,pxmousey = norm2pix((nmmousex,nmmousey))
+            nmmousex,nmmousey = pix2norm((rawmousex,rawmousey))
+            pxmousex,pxmousey = ((rawmousex,rawmousey))
             print(f"mouse event = {event} ({rawmousex:.04f},{rawmousey:0.04f}) ({nmmousex:.04f},{nmmousey:.04f}) ({pxmousex},{pxmousey})")
             if event==cv2.EVENT_MBUTTONDOWN:
                 # poor man's zoom until we move to Qt or whatever.
                 print(f"clicked.")
-                pxrectwidth = DISPLAY_WIDTH//2
-                pxrectheight = DISPLAY_HEIGHT//2
-
-                pxrectx = pxmousex//2
-                pxrecty = pxmousey//2
-                zx0,zy0,zx1,zy1 = pix2norm((pxrectx,pxrecty,pxrectx+pxrectwidth,pxrecty+pxrectheight))
-                print(f"zoomed to ({zx0:.03f},{zy0:.03f}),({zx1:.03f},{zy1:.03f})")
-                '''
-                # establish rectangle
-                pxxbound = frames[0].shape[1]
-                pxybound = frames[0].shape[0]
-                pxzx0 = int(pxmousex-120)
-                pxzx1 = int(pxmousex+120)
-                pxzy0 = int(pxmousey-80)
-                pxzy1 = int(pxmousey+80)
-                if pxzx0 < 0:
-                    pxzx1 -= pxzx0
-                    pxzx0 -= pxzx0
-                if pxzy0 < 0:
-                    pxzy1 -= pxzy0
-                    pxzy0 -= pxzy0
-                if pxzx1 >= pxxbound:
-                    pxzx0 -= pxzx1 - pxxbound-1
-                    pxzx1 -= pxzx1 - pxxbound-1
-                if pxzy1 >= pxybound:
-                    pxzy0 -= pxzy1 - pxybound-1
-                    pxzy1 -= pxzy1 - pxybound-1
-
-                zx0,zy0,zx1,zy1 = pix2norm((pxzx0,pxzy0,pxzx1,pxzy1))
-                '''
+                # calculate new zoom level in normalized coordinates
+                nmrectwidth = zx1-zx0
+                nmrectheight =zy1-zy0
+                if nmrectwidth < 5/DISPLAY_WIDTH or nmrectheight < 5/DISPLAY_HEIGHT:
+                    zx0 = 0
+                    zy0 = 0
+                    zx1 = 1.0
+                    zy1 = 1.0
+                    print(f"zoomed out")
+                else:
+                    nmrectx = zx0 + nmmousex*nmrectwidth/2
+                    nmrecty = zy0 + nmmousey*nmrectheight/2
+                    nmrectwidth /= 2
+                    nmrectheight /= 2
+                    zx0 = nmrectx
+                    zy0 = nmrecty
+                    zx1 = nmrectx + nmrectwidth
+                    zy1 = nmrecty + nmrectheight
+                print(f"zoomed to (zx0:{zx0:.03f},zy0:{zy0:.03f}),(zx1:{zx1:.03f},zy1:{zy1:.03f})")
             elif event == cv2.EVENT_MOUSEMOVE:
                 if creating_mode:
                     #if we've dragged more than 5 pixels, create a new annotation
@@ -883,6 +910,7 @@ while True:
 
                         dragging_origin_x,dragging_origin_y = (nmmousex,nmmousey)
                         save_flag = True
+
             elif event == cv2.EVENT_LBUTTONDOWN:
                 # if we are hovering over an annotation, start dragging it
                 if hovering_over is not None and hovering_over >= 0 and hovering_over < len(annotations[pos_frames]):
