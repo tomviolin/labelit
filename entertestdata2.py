@@ -208,7 +208,7 @@ def rect_transp_fill(img,rect,color, alpha=0.5, border=-1):
 
 STREAKING=False
 NUM_MED = 3
-FRAME_MEDIAN_STRIDE = 1
+FRAME_MEDIAN_STRIDE = 3
 def sigmoid(x):
     return 1/(1+np.exp(-(x-0.5)*10))
 
@@ -287,7 +287,7 @@ while True:
     frames_to_skip = 1
     if hires_mode:
         frames_to_read = 999
-        frames_to_skip =1 
+        frames_to_skip =3 
     if findex < 0:
         findex = 0
     if findex >= len(fdf_filenames):
